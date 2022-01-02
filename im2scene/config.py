@@ -123,7 +123,7 @@ def get_renderer(model, cfg, device):
     return renderer
 
 
-def get_dataset(cfg, **kwargs):
+def get_dataset(cfg, mode, **kwargs):
     ''' Returns a dataset instance.
 
     Args:
@@ -148,6 +148,7 @@ def get_dataset(cfg, **kwargs):
             dataset_folder, size=img_size,
             use_tanh_range=cfg['data']['use_tanh_range'],
             celebA_center_crop=cfg['data']['celebA_center_crop'],
+            train_mode= mode,
             random_crop=cfg['data']['random_crop'],
         )
     return dataset

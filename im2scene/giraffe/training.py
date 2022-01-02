@@ -13,7 +13,7 @@ from skimage.metrics import structural_similarity as compare_ssim
 import numpy as np 
 import pdb 
 import math 
-
+from utils import losses, geom_utils
 logger_py = logging.getLogger(__name__)
 
 
@@ -82,18 +82,19 @@ class Trainer(BaseTrainer):
             data (dict): data dictionary
             it (int): training iteration
         '''
-        loss_gen, loss_recon, swap_g = self.train_step_generator(data, it)
-        loss_d, reg_d, real_d, swap_d = self.train_step_discriminator(data, it)
+        loss_gen, fake_g = self.train_step_generator(data, it)
+        loss_d, reg_d, real_d, fake_d = self.train_step_discriminator(data, it)
 
         return {
             'gen_total': loss_gen,
-            'recon': loss_recon,
-            'swap_g': swap_g,
+            # 'loss_recon': loss_recon,
+            'fake_g': fake_g,
             'disc_total': loss_d,
             'regularizer': reg_d,
             'real_d': real_d,
-            'swap_d': swap_d,
+            'fake_d': fake_d,
         }
+
 
     def eval_step(self):
         ''' Performs a validation step.
@@ -130,44 +131,79 @@ class Trainer(BaseTrainer):
 
         toggle_grad(generator, True)
         toggle_grad(discriminator, False)
+
         generator.train()
         discriminator.train()
 
         self.optimizer.zero_grad()
 
-        x_real = data.get('image').to(self.device)
-        pose_real = data.get('pose').to(self.device)
+        x_img = data.get('img').to(self.device).float()
+        pose_real = data.get('sfm_pose').to(self.device).float()
+        mask_real = data.get('mask').to(self.device).float()
+        rot_real = data.get('rotmat').to(self.device).float()
+
+        x_real = x_img * mask_real.unsqueeze(1).repeat(1, 3, 1, 1)  # matrix multiplication
 
         if self.multi_gpu:
             latents = generator.module.get_vis_dict(x_real.shape[0])
-            # x_fake, x_fake2, x_swap = generator(x_real, pose_real, **latents)        # pred, swap, rand
-            x_fake, x_swap = generator(x_real, pose_real, **latents)        # pred, swap, rand
+            x_fake = generator(x_real, pose_real, **latents)        # pred, swap, rand
 
         else:
-            # x_fake, x_fake2, x_swap = generator(x_real, pose_real)
-            x_fake, x_swap = generator(x_real, pose_real)
+            x_fake = generator(x_real, pose_real)     # visualize할 때만 swapped view도 볼 것
+    
+        # gan loss만!
+        '''
+        # camera loss 
+        cam_from_GT = generator.resnet(x_real)             # 이떄도 resnet grad는 None 
+        cam_from_GT_quat = torch.cat(cam_from_GT, dim=-1)   
+
+        cam_GT_loss = generator.camera_loss(cam_from_GT_quat, pose_real, 0)
+        cam_GT_loss.backward()                      # neural renderer쪽 grad도 잘 유지되는거 확인 
+        
+        # gan loss
+        # camera에 grad 안받게 하고 
+        for param in generator.resnet.parameters():      # self.resnet: camera parameter predictor given image 
+            param.requires_grad = False 
+
+        ####### requires grad로 사용하면 안되나? -> Runtime Error가 뜬다고는 하지만 우선 봐보자 
+        # camera loss는 편의상 여기서 backward! 
+        cam_from_pred = generator.resnet(x_fake)
+        cam_from_pred_quat = torch.cat(cam_from_pred, dim=-1)
+
+        cam_pred_loss = generator.camera_loss(cam_from_pred_quat, pose_real, 0)
+
+        d_fake = discriminator(x_fake)
+        gloss_fake = compute_bce(d_fake, 1)
+        '''
+        d_fake = discriminator(x_fake)
+        gloss_fake = compute_bce(d_fake, 1)
 
 
-        # d_fake = discriminator(x_fake)
-        d_swap = discriminator(x_swap)
-        # gloss = compute_bce(d_fake, 1)
-        gloss_swap = compute_bce(d_swap, 1)
-
-        loss_recon = self.recon_loss(x_fake, x_real) * self.recon_weight
-        # loss_new = self.recon_loss(x_fake2, x_real[1].to(self.device)) * self.recon_weight
-
-        gen_loss = loss_recon + gloss_swap
-        # gen_loss = (loss_new + loss_recon)/2 
-        # gen_loss = loss_recon
-
+        # loss_recon = self.recon_loss(x_fake, x_real) * self.recon_weight
+        # gen_loss = gloss_fake + cam_pred_loss
+        gen_loss = gloss_fake
         gen_loss.backward()
         self.optimizer.step()
 
         if self.generator_test is not None:
             update_average(self.generator_test, generator, beta=0.999)
 
-        return gen_loss.item(), loss_recon.item(), gloss_swap.item()
-        # return gen_loss.item(), loss_recon.item()
+        return gen_loss.item(), gloss_fake.item()
+
+    def camera_loss(self, cam_pred, cam_gt, margin):
+        """
+        cam_* are B x 7, [sc, tx, ty, quat]
+        Losses are in similar magnitude so one margin is ok.
+        """
+        rot_pred = cam_pred[:, -4:]
+        rot_gt = cam_gt[:, -4:]
+
+        rot_loss = hinge_loss(quat_loss_geodesic(rot_pred, rot_gt), margin)
+        # Scale and trans.
+        st_loss = (cam_pred[:, :3] - cam_gt[:, :3])**2
+        st_loss = hinge_loss(st_loss.view(-1), margin)
+
+        return rot_loss.mean() + st_loss.mean()
 
 
     def train_step_discriminator(self, data, it=None, z=None):
@@ -180,8 +216,11 @@ class Trainer(BaseTrainer):
 
         self.optimizer_d.zero_grad()
 
-        x_real = data.get('image').to(self.device)
-        pose_real = data.get('pose').to(self.device)
+        x_img = data.get('img').to(self.device).float()
+        pose_real = data.get('sfm_pose').to(self.device).float()
+        mask_real = data.get('mask').to(self.device).float()
+        x_real = x_img * mask_real.unsqueeze(1).repeat(1, 3, 1, 1)  # matrix multiplication
+
 
         loss_d_full = 0.
 
@@ -197,24 +236,24 @@ class Trainer(BaseTrainer):
         with torch.no_grad():
             if self.multi_gpu:
                 latents = generator.module.get_vis_dict(batch_size=x_real.shape[0])
-                x_swap = generator(x_real, pose_real, **latents)[1]
+                x_fake = generator(x_real, pose_real, **latents)     # fake, swap은 굳이 필요는 없음
             else:
-                x_swap = generator(x_real, pose_real)[1]
+                x_fake = generator(x_real, pose_real)
 
-        x_swap.requires_grad_()
-        d_swap = discriminator(x_swap)
 
-        d_loss_swap = compute_bce(d_swap, 0)
+        x_fake.requires_grad_()
+        d_fake = discriminator(x_fake)
+        d_loss_fake = compute_bce(d_fake, 0)
+        loss_d_full += d_loss_fake
 
-        loss_d_full += d_loss_swap
 
         loss_d_full.backward()
         self.optimizer_d.step()
 
-        d_loss = (d_loss_real + d_loss_swap)
+        d_loss = (d_loss_real + d_loss_fake)
 
         return (
-            d_loss.item(), reg.item(), d_loss_real.item(), d_loss_swap.item())
+            d_loss.item(), reg.item(), d_loss_real.item(), d_loss_fake.item())
 
     # def record_uvs(self, uv, path, it):
     #     out_path = os.path.join(path, 'uv.txt')
@@ -260,18 +299,12 @@ class Trainer(BaseTrainer):
         
         return torch.stack([theta, phi], dim=-1) #16, 2
 
-    # #'ㅅ'
-    # def loc2rad(self, loc):
-    #     theta = torch.acos(loc[:, 2])
-    #     phi = torch.acos(loc[:,0]/torch.sin(theta))
-    #     theta, phi = theta * 180 / torch.pi, phi * 180 / torch.pi
-    #     return torch.cat([theta, phi], dim=-1)
-
-    # edit
     def loc2rad(self, loc):
         phi = torch.acos(loc[:, 2])
+        plusidx = torch.where(loc[:,1]<0)[0]
         theta = torch.acos(loc[:,0]/torch.sin(phi))
-        theta, phi = theta * 180 / torch.pi, phi * 180 / torch.pi
+        theta[plusidx] = 2*math.pi-theta[plusidx]
+        theta, phi = theta * 180 / math.pi, phi * 180 / math.pi
         return torch.cat([theta, phi], dim=-1)
 
 
@@ -289,11 +322,15 @@ class Trainer(BaseTrainer):
         gen.eval()
         with torch.no_grad():
             # edit mira start 
-            x_real = data.get('image').to(self.device)
-            x_pose = data.get('pose').to(self.device)
+            x_img = data.get('img').to(self.device).float()
+            x_pose = data.get('sfm_pose').to(self.device).float()
+            x_rot = data.get('rotmat').to(self.device).float()
+            x_mask = data.get('mask').to(self.device).float()
+            x_real = x_img * x_mask.unsqueeze(1).repeat(1, 3, 1, 1)  # matrix multiplication
+
             # image_fake, image_fake2, image_swap, uvs = self.generator(x_real, x_pose, mode='val', need_uv=True)
             # image_fake, image_fake2, image_swap = image_fake.detach(), image_fake2.detach(), image_swap.detach()
-            image_fake, image_swap, image_rand, uvs, radius = self.generator(x_real, x_pose, mode='val', need_uv=True)
+            image_fake, image_swap, image_rand, rand_cam = self.generator(x_real, x_pose, x_rot, mode='val', need_uv=True)
             image_fake, image_swap, image_rand = image_fake.detach(), image_swap.detach(), image_rand.detach()
 
             # edit mira end 
@@ -308,30 +345,30 @@ class Trainer(BaseTrainer):
             # # 오키.. def encoder에서 생긴 얘가 여기로 들어감!
             # xyz = xyz_rot + self.poses[:, None, :3, 3]      # 얘네가 sampling points!     # 아무튼 여기가 transform query points into the camera spaces! (self.poses를 곱함!) 
 
-
-
             # 여기 안을 잘 조정하면 -> swapped view에서도 비슷한 맥락으로 나올 듯 
             # edit 'ㅅ'
-            randrad = self.uv2rad(uvs).cuda()        # uv를 radian으로 표현 
-            rotmat1 = x_pose[:,:3,:3]        # x_pose : real pose that includes R,t
-            # rotmat2 = x_pose[:, 1][:,:3,:3]        # x_pose : real pose that includes R,t
-            # import pdb 
-            # pdb.set_trace()
-            origin = torch.Tensor([0,0,1]).to(self.device).repeat(int(len(x_pose)),1).unsqueeze(-1)
+            # randrad = self.uv2rad(uvs).cuda()        # uv를 radian으로 표현 
+            rotmat_rand = geom_utils.quat_to_rotmat(rand_cam[:, -4:])
+            rotmat_gt = geom_utils.quat_to_rotmat(x_pose[:, -4:])
 
-            # translation을 먼저 함 
-            # camloc1 = rotmat1@(origin+x_pose[:,:3,3].unsqueeze(-1))   # 얘는 x,y 둘다 못건짐 
-            # camloc1 = rotmat1@origin + x_pose[:,:3,3].unsqueeze(-1)         # rotmat1@origin의 norm은 1, translation까지 더해줘야 함 
-            # camloc1 = camloc1 / torch.norm(camloc1, dim=-2).reshape(-1, 1, 1)
+            # 원래 
+            # origin = torch.Tensor([0,-1,0]).to(self.device).repeat(int(len(x_pose)),1).unsqueeze(-1)
+            # origin = torch.Tensor([0,0,1]).to(self.device).repeat(int(len(x_pose)),1).unsqueeze(-1)
+            # origin = torch.Tensor([0,1,0]).to(self.device).repeat(int(len(x_pose)),1).unsqueeze(-1)
+            # origin = torch.Tensor([0,0,-1]).to(self.device).repeat(int(len(x_pose)),1).unsqueeze(-1)
+            origin = torch.Tensor([1,0,0]).to(self.device).repeat(int(len(x_pose)),1).unsqueeze(-1)
 
-            camloc1 = rotmat1@origin    # rotmat1@origin의 norm은 1, translation까지 더해줘야 함 
-            radian1 = self.loc2rad(camloc1) 
 
-            # camloc2 = rotmat2@origin
-            # radian2 = self.loc2rad(camloc2) 
+            camloc_rand = rotmat_rand@origin    # rotmat1@origin의 norm은 1, translation까지 더해줘야 함 
+            radian_rand = self.loc2rad(camloc_rand) 
+
+            camloc_gt = rotmat_gt@origin    # rotmat1@origin의 norm은 1, translation까지 더해줘야 함 
+            radian_gt = self.loc2rad(camloc_gt) 
+
 
             #pdb.set_trace()
-            uvs_full = (radian1, radian1.flip(0), randrad)#gt, swap    3, 16, 2
+            # uvs_full = (radian1, radian1.flip(0), new_rad)#gt, swap    3, 16, 2
+            uvs_full = (radian_gt, radian_gt.flip(0), radian_rand)#gt, swap    3, 16, 2
 
 
         # edit mira start

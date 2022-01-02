@@ -56,7 +56,7 @@ class Trainer(BaseTrainer):
 
         self.visualize_z = torch.randn(
             16, self.generator.z_dim).to(device)
-
+        
         if vis_dir is not None and not os.path.exists(vis_dir):
             os.makedirs(vis_dir)
 

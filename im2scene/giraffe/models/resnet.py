@@ -9,7 +9,7 @@ __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
 
 
 model_urls = {
-    'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
+    'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
 }
 
 
@@ -106,9 +106,15 @@ class ResNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc1 = nn.Linear(512 * block.expansion, 512 * block.expansion)
         self.fc2 = nn.Linear(512 * block.expansion, 512 * block.expansion)
-        self.dec_uv = nn.Linear(512 * block.expansion, 2)
         self.dec_shape = nn.Linear(512 * block.expansion, shape_dim)
         self.dec_appearance = nn.Linear(512 * block.expansion, app_dim)
+
+        # self.dec_uv = nn.Linear(512 * block.expansion, 2)      # 우선은 uv로 계산 고고
+        # for camera prediction 
+        self.quat_pred  = nn.Linear(512 * block.expansion, 4)
+        self.trans_pred  = nn.Linear(512 * block.expansion, 2)
+        self.scale_pred  = nn.Linear(512 * block.expansion, 1)
+
         self.sigmoid = nn.Sigmoid()
 
 
@@ -160,6 +166,7 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
+
     def _forward_impl(self, x):
         # See note [TorchScript super()]
 
@@ -178,6 +185,13 @@ class ResNet(nn.Module):
         x = self.fc1(x)
         x = self.fc2(x)
         # uv = self.sigmoid(self.dec_uv(x))
+        # return uv
+        '''
+        quat = self.quat_pred(x)
+        trans = self.trans_pred(x)
+        scale = self.scale_pred(x)
+        return quat, trans, scale
+        '''
         shape = self.dec_shape(x)
         appearance = self.dec_appearance(x)
         # return uv, shape, appearance
@@ -198,15 +212,15 @@ def _resnet(arch, block, layers, pretrained, progress, shape_dim, app_dim, **kwa
     return model
 
 
-def resnet34(pretrained=False, shape_dim=None, app_dim=None, progress=True, **kwargs):
-    r"""ResNet-34 model from
+def resnet18(pretrained=False, shape_dim=None, app_dim=None, progress=True, **kwargs):
+    r"""ResNet-18 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
 
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _resnet('resnet34', BasicBlock, [3, 4, 6, 3], pretrained, progress, shape_dim, app_dim, 
+    return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, progress, shape_dim, app_dim,
                    **kwargs)
 
 

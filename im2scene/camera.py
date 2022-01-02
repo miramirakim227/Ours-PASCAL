@@ -8,14 +8,16 @@ def get_camera_mat(fov=49.13, invert=True):
     # fov = 2 * arctan( sensor / (2 * focal))
     # focal = (sensor / 2)  * 1 / (tan(0.5 * fov))
     # in our case, sensor = 2 as pixels are in [-1, 1]
-    focal = 1. / np.tan(0.5 * fov * np.pi/180.)
+    focal = 1. / np.tan(0.5 * fov * np.pi/180.) # <- focal length 
     focal = focal.astype(np.float32)
-    mat = torch.tensor([
+    mat = torch.tensor([        # focal = 2.1877193
         [focal, 0., 0., 0.],
         [0., focal, 0., 0.],
         [0., 0., 1, 0.],
         [0., 0., 0., 1.]
     ]).reshape(1, 4, 4)
+    # import pdb 
+    # pdb.set_trace()
 
     if invert:
         mat = torch.inverse(mat)
@@ -38,7 +40,16 @@ def get_random_pose(u, v, range_radius, batch_size=16,  # batch size 유동적�
     R = look_at(loc)
     RT = torch.eye(4).reshape(1, 4, 4).repeat(batch_size, 1, 1)
     RT[:, :3, :3] = R
+    RT[:, :2, -1] = loc[:, :-1]
+    # import pdb ; pdb.set_trace()
+    
+    '''
     RT[:, :3, -1] = loc
+    '''
+
+    # NOTICE: normalize since generated cameras have different scale of basis vector
+    RT[:, :3, 0] = RT[:, :3, 0] / torch.norm(RT[:, :3, 0], dim=-1).unsqueeze(-1).repeat(1, 3)
+    RT[:, :3, 1] = RT[:, :3, 1] / torch.norm(RT[:, :3, 1], dim=-1).unsqueeze(-1).repeat(1, 3)
 
     if invert:
         RT = torch.inverse(RT)

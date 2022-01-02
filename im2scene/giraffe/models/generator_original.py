@@ -80,7 +80,7 @@ class Generator(nn.Module):
         else:
             self.neural_renderer = None
 
-    def forward(self, img, pose, batch_size=32, latent_codes=None, camera_matrices=None,
+    def forward(self, img, pose, rot, batch_size=32, latent_codes=None, camera_matrices=None,
                 transformations=None, bg_rotation=None, mode="training", it=0,
                 return_alpha_map=False,
                 not_render_background=False,
@@ -90,77 +90,132 @@ class Generator(nn.Module):
         # 랜덤하게 두개만 뽑자     
         img1 = img.to(self.device).float()
 
-        '''
+        # check quaternion if it's unit
+
+        ## cam from quat matrix to full perspective projection 
+        # rot =  geom_utils.quat_to_rotmat(pose[:, -4:])        # (batch, 7) -> (batch, 3, 3)     # scale, trans, rot
+        
         trans = pose[:, 1:3]
         scale = pose[:, 0]
-        quat = pose[:, -4:]
-        '''
+        
+        # trans_3d_1= torch.cat([trans[:, 0].unsqueeze(-1), trans[:, 1].unsqueeze(-1), torch.zeros(img1.shape[0], 1).to(self.device)], dim=-1)     # tx, ty의 의미..
+
+        # scale = scale.reshape(-1, 1).repeat(1, 3)
+        # trans_3d = trans_3d_1 / scale
+        # rot = torch.cat([pose_rot, trans_3d.unsqueeze(-1)], dim=-1)  
+        # ones = torch.tensor([0, 0, 0, 1]).reshape(1, 1, -1).repeat(img1.shape[0], 1, 1).to(self.device).float()
+        # pose_rot = torch.cat([rot, ones], dim=1)
+        trans_added = torch.zeros_like(rot[:, :3, 2])   # (batch, 3)
+        trans_added[:, -1] = rot[:, 2, -1]
+        trans_added[:, :-1] = rot[:, :2, -1]
+        pose_rot = torch.cat([rot, trans_added.unsqueeze(-1)], dim=-1)
+        ones = torch.tensor([0, 0, 0, 1]).reshape(1, 1, -1).repeat(img1.shape[0], 1, 1).to(self.device).float()
+        pose_rot = torch.cat([pose_rot, ones], dim=1)
+        
+        
+        rot = geom_utils.quat_to_rotmat(quat)
+        dumm = torch.tensor([0, 0, 0]).reshape(1, 3, 1).repeat(len(trans), 1, 1).to(self.device)
+        inverse_rot = torch.cat([torch.inverse(rot), dumm], dim=-1)
+        inverse_quat_check = tgm.rotation_matrix_to_quaternion(inverse_rot)   
+
+        # import pdb 
+        # pdb.set_trace()
+
+        # K, rotMat, tvec = cv2.decomposeProjectionMatrix(np.array(Rt[0].cpu()))[:3]      # 모든 rotmat, translation에 대해서 이거넣고 돌려버리기..? -> getitem에서..! <- quat과의 관계 파악하기 
+
+        # focal = 300 # suppose TODO: find from CMR       # focal 찾으면 바로 이거로 바꾸기 # focal은 cv2.mat으로 찾아내기..?
+        # trans_full = torch.stack([trans[:, 0], trans[:, 1], 2*focal/(img.shape[-1] * scale + 1e-9)], dim=-1).unsqueeze(-1).float()
+        # pose_rt = torch.cat([rot, trans_full], dim=-1)
+        # pose_rot = torch.cat([pose_rt, torch.zeros(img.shape[0], 1, 4).to(self.device)], dim=1).float()
+        # pose_rot[:, -1, -1] = 1
+
         batch_size = img1.shape[0]
-        # shape, appearance = self.resnet(img1)
         shape, appearance = torch.randn(batch_size, self.z_dim).to(self.device), torch.randn(batch_size, self.z_dim).to(self.device)
+        # shape, appearance = self.resnet(img1)
         latent_codes1 = shape, appearance
-
-
+        
         '''
         max_range = max(torch.norm(trans_3d, dim=-1)).cpu()
         self.range_radius = (max_range, max_range)
         '''
         
         if camera_matrices is None: 
-            '''    
-            rand_quat = torch.randn(len(trans), 4)
-            rand_quat /= torch.norm(rand_quat, dim=-1).unsqueeze(-1)
-            rand_scale = (torch.ones(len(trans)) * torch.randn(1,)).unsqueeze(-1)
-            rand_trans = torch.randn(len(trans), 2)     
-            rand_cam = torch.cat([rand_scale, rand_trans, rand_quat], dim=-1)
-            '''    
-            gt_cam = pose
-            swap_cam = pose.flip(0)
+            random_u = torch.rand(batch_size)*(self.range_u[1] - self.range_u[0]) + self.range_u[0]
+            random_v = torch.rand(batch_size)*(self.range_v[1] - self.range_v[0]) + self.range_v[0]
+            # 정해진 batch size만큼 나옴 
+
+            rand_camera_matrices = self.get_random_camera(random_u, random_v, batch_size)   # 사잇값이 가지런하게 나옴 
+            intrinsic_mat = rand_camera_matrices[0]
+            # u, v = uv[:, 0], uv[:, 1]
+            # v = v/2
+            
+            camera_matrices = tuple((intrinsic_mat, pose_rot))    # 앞부분 mat 
+            # new_cam_matrices = tuple((intrinsic_mat, pose2))   # 뒷부분 mat 
+            swap_camera_matrices = tuple((intrinsic_mat, pose_rot.flip(0)))    # 앞부분 mat 
+
+            front_mat = pose_rot[:int(batch_size / 2)]
+            back_mat = pose_rot[int(batch_size / 2):]
+            new_mat = torch.cat([back_mat, front_mat], dim=0)
+            assert len(new_mat) == batch_size
+            new_camera_matrices = tuple((intrinsic_mat, new_mat))
+
 
         else:
             print('oh noooo')
             pdb.set_trace()
 
+
+        if transformations is None:
+            # transformations = pose
+            # swap_transformations = pose.flip(0)
+            transformations = self.get_random_transformations(batch_size)     
+
         # edit mira end 
 
         if return_alpha_map:
             rgb_v, alpha_map = self.volume_render_image(
-                latent_codes1, gt_cam, 
+                latent_codes1, camera_matrices, 
                 mode=mode, it=it, return_alpha_map=True,
                 not_render_background=not_render_background)
             return alpha_map
         else:
             rgb_v = self.volume_render_image(
-                latent_codes1, gt_cam, transformations, 
+                latent_codes1, camera_matrices, transformations, 
                 mode=mode, it=it, not_render_background=not_render_background,
                 only_render_background=only_render_background)
             swap_rgb_v = self.volume_render_image(
-                latent_codes1, swap_cam, transformations, 
+                latent_codes1, swap_camera_matrices, transformations, 
+                mode=mode, it=it, not_render_background=not_render_background,
+                only_render_background=only_render_background)
+            rand_rgb_v = self.volume_render_image(
+                latent_codes1, new_camera_matrices, transformations, 
                 mode=mode, it=it, not_render_background=not_render_background,
                 only_render_background=only_render_background)
 
             if self.neural_renderer is not None:
                 rgb = self.neural_renderer(rgb_v)
+                # rgb2 = self.neural_renderer(rgb_v2)
                 swap_rgb = self.neural_renderer(swap_rgb_v)
+                rand_rgb = self.neural_renderer(rand_rgb_v)
             else:
                 rgb = rgb_v
+                # rgb2 = rgb_v2
                 swap_rgb = swap_rgb_v
+                rand_rgb = rand_rgb_v
 
 
             if mode == 'val':
-                rand_cam = torch.cat([gt_cam[2:], gt_cam[:2]], dim=0) 
                 rand_rgb_v = self.volume_render_image(
-                    latent_codes1, rand_cam, transformations, 
+                    latent_codes1, new_camera_matrices, transformations, 
                     mode=mode, it=it, not_render_background=not_render_background,
                     only_render_background=only_render_background)
                 rand_rgb = self.neural_renderer(rand_rgb_v)
-                return rgb, swap_rgb, rand_rgb, rand_cam
+                return rgb, swap_rgb, rand_rgb, torch.cat((random_u.unsqueeze(-1), random_v.unsqueeze(-1)), dim=-1), self.radius[0].to(self.device), rand_camera_matrices[1]
 
             if need_uv==True:
-                return rgb, swap_rgb, rand_rgb, rand_cam
+                return rgb, swap_rgb, torch.cat((random_u.unsqueeze(-1), random_v.unsqueeze(-1)), dim=-1)
             else:
                 return rgb
-
 
     def camera_loss(self, cam_pred, cam_gt, margin):
         """
@@ -375,18 +430,15 @@ class Generator(nn.Module):
 
         pixels_world_i = self.transform_points_to_box(
             pixels_world, transformations)
-
         camera_world_i = self.transform_points_to_box(
             camera_world, transformations)
         ray_i = pixels_world_i - camera_world_i     # 여기가 parallel하도록 바뀌어야 함 
         # ray_i는 그대로 사용!
 
-        p_i = camera_world_i.unsqueeze(-2).contiguous() + \
-            di.unsqueeze(-1).contiguous() * ray_i.unsqueeze(-2).contiguous()
+        # import pdb 
+        # pdb.set_trace()
+        p_i = camera_world_i.unsqueeze(-2).contiguous() + di.unsqueeze(-1).contiguous() * ray_i.unsqueeze(-2).contiguous()    # point sampling 과정       # batch, 16x16, 64, 3 # 아하.. 한 ray에 64개의 points.. 
         ray_i = ray_i.unsqueeze(-2).repeat(1, 1, n_steps, 1)
-
-        # p_i = pixels_world_i    # point sampling 과정       # batch, 16x16, 64, 3 # 아하.. 한 ray에 64개의 points.. 
-        # ray_i = ray_i.unsqueeze(-2).repeat(1, 1, n_steps, 1)
         assert(p_i.shape == ray_i.shape)
 
         p_i = p_i.reshape(batch_size, -1, 3)
@@ -462,7 +514,7 @@ class Generator(nn.Module):
         object_existance = object_existance.astype(np.bool)
         return object_existance
 
-    def volume_render_image(self, latent_codes, sfm_pose,
+    def volume_render_image(self, latent_codes, camera_matrices,
                             transformations, mode='training',       # transformation: 의미 X 
                             it=0, return_alpha_map=False,
                             not_render_background=False,
@@ -483,19 +535,26 @@ class Generator(nn.Module):
                                invert_y_axis=False)[1].to(device)   # (batch, 16(res)x16(res), 2(xy))
         pixels[..., -1] *= -1.  # y축에 -1을 곱함. 왜지.. 그래야 image plane인가봄.. 왼쪽 위에가 -, 왼쪽 밑이 + 
         # Project to 3D world
-
-        # pixel_world, camera_world에 녹아들어가 있음 
-        # orthographic matrix를 사용할 경우, intrinsic의 영향을 받지 않음 
-
         pixels_world = image_points_to_world(
-            pixels, sfm_pose = sfm_pose)       # fixed depth value 1까지 고려해서 -> (batch, resxres, 3)       # worldmat: randomly sampled
+            pixels, camera_mat=camera_matrices[0],     
+            world_mat=camera_matrices[1])       # fixed depth value 1까지 고려해서 -> (batch, resxres, 3)       # worldmat: randomly sampled
+        '''
+        camera_matrices_v2 = camera_matrices[1].clone()
+        camera_matrices_v2[:, 2, 3] += 1.0
 
+        camera_world = image_points_to_world(
+            pixels, camera_mat=camera_matrices[0],     
+            world_mat=camera_matrices_v2[1])       # fixed depth value 1까지 고려해서 -> (batch, resxres, 3)       # worldmat: randomly sampled
+
+        ray_vector = pixels_world - camera_world
+        '''
+        
         camera_world = origin_to_world(     
-            n_points, sfm_pose = sfm_pose)
+            n_points, camera_mat=camera_matrices[0],
+            world_mat=camera_matrices[1])
 
-        ray_vector = pixels_world - camera_world        # ray vector를 만드는 방법에서 차이!    # 16. 256. 3이어야!
-        # (16, 256, 3)
-
+        ray_vector = pixels_world - camera_world        # ray vector를 만드는 방법에서 차이!
+        
         # camera world 가 뭔가 orthogonal하게 
         # TODO: make ray vector that is orthographic to pixels wordls 
         # batch_size x n_points x n_steps
